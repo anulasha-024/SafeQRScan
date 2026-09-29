@@ -1,426 +1,183 @@
 import 'dart:math' as math;
-
-import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:permission_handler/permission_handler.dart';
+import 'package:flutter/foundation.dart';
+import 'package:image_picker/image_picker.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
+import '../services/api_service.dart';
+import 'history_page.dart';
+import 'verification_result_page.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
-
   @override
   State<HomePage> createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage>
-    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
-  CameraController? _cameraController;
-  List<CameraDescription> _cameras = [];
-
-  int _currentCameraIndex = 0;
-  PermissionStatus _cameraPermissionStatus = PermissionStatus.denied;
-
-  bool _isCameraLoading = false;
-  bool _flashOn = false;
-  bool _cameraError = false;
-
-  double _minZoom = 1.0;
-  double _maxZoom = 4.0;
-  double _currentZoom = 1.0;
-
+class _HomePageState extends State<HomePage> with SingleTickerProviderStateMixin, WidgetsBindingObserver {
+  final _scanner = MobileScannerController(formats: [BarcodeFormat.qrCode]);
   late final AnimationController _scanLineController;
+  bool _busy = false;
+  bool _scannerVisible = true;
+  double _zoom = 0;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
-
-    _scanLineController = AnimationController(
-      vsync: this,
-      duration: const Duration(milliseconds: 1800),
-    )..repeat(reverse: true);
-
-    WidgetsBinding.instance.addPostFrameCallback((_) async {
-      await _requestCameraPermission();
-    });
+    _scanLineController = AnimationController(vsync: this,
+        duration: const Duration(milliseconds: 1800))..repeat(reverse: true);
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _scanLineController.dispose();
-    _cameraController?.dispose();
+    _scanner.dispose();
     super.dispose();
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    final controller = _cameraController;
-    if (controller == null || !controller.value.isInitialized) return;
-
-    if (state == AppLifecycleState.inactive) {
-      controller.dispose();
-      _cameraController = null;
-    } else if (state == AppLifecycleState.resumed &&
-        _cameraPermissionStatus.isGranted) {
-      _initializeCamera();
+    if (!_scanner.value.hasCameraPermission || !_scannerVisible) return;
+    if (state == AppLifecycleState.resumed) {
+      _scanner.start().catchError((Object error) => _showError(error));
+    } else if (state == AppLifecycleState.inactive) {
+      _scanner.stop().catchError((Object error) => _showError(error));
     }
   }
 
-  Future<void> _requestCameraPermission() async {
-    final status = await Permission.camera.request();
+  void _showError(Object error) {
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text(error.toString().replaceFirst('Exception: ', ''))));
+    }
+  }
 
+  String? _payload(BarcodeCapture capture) {
+    for (final barcode in capture.barcodes) {
+      final value = barcode.rawValue;
+      if (value != null && value.trim().isNotEmpty) return value;
+    }
+    return null;
+  }
+
+  Future<void> _onDetect(BarcodeCapture capture) async {
+    if (_busy) return;
+    final payload = _payload(capture);
+    if (payload != null) await _verify(payload);
+  }
+
+  Future<void> _verify(String payload) async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      final result = await ApiService.verifyQr(payload);
+      if (!mounted) return;
+      setState(() => _scannerVisible = false);
+      await Navigator.of(context).push(MaterialPageRoute<void>(
+          builder: (_) => VerificationResultPage(payload: payload, result: result)));
+    } catch (error) {
+      if (!mounted) return;
+      await showDialog<void>(context: context, builder: (context) => AlertDialog(
+          title: const Text('Verification unavailable'),
+          content: Text('$error\n\nThis QR code has not been verified.'),
+          actions: [TextButton(onPressed: () => Navigator.pop(context),
+              child: const Text('Try again'))]));
+    } finally {
+      if (mounted) setState(() { _busy = false; _scannerVisible = true; });
+    }
+  }
+
+  Future<void> _gallery() async {
+    if (_busy) return;
+    if (kIsWeb) { _showError('Gallery scanning is available on Android and iOS.'); return; }
+    setState(() => _busy = true);
+    String? payload;
+    try {
+      final image = await ImagePicker().pickImage(source: ImageSource.gallery);
+      if (image != null) {
+        final capture = await _scanner.analyzeImage(image.path);
+        payload = capture == null ? null : _payload(capture);
+        if (payload == null) _showError('No QR code found in this image.');
+      }
+    } catch (error) { _showError(error); }
+    finally { if (mounted) setState(() => _busy = false); }
+    if (mounted && payload != null) await _verify(payload);
+  }
+
+  Future<void> _manualEntry() async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    String value = '';
+    final payload = await showDialog<String>(context: context, builder: (context) => AlertDialog(
+      title: const Text('Verify QR text'),
+      content: TextField(maxLines: 5, onChanged: (text) => value = text,
+          decoration: const InputDecoration(hintText: 'Paste the QR payload')),
+      actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
+        FilledButton(onPressed: () {
+          if (value.trim().isNotEmpty) Navigator.pop(context, value.trim());
+        }, child: const Text('Verify'))],
+    ));
     if (!mounted) return;
-    setState(() {
-      _cameraPermissionStatus = status;
-    });
-
-    if (status.isGranted) {
-      await _initializeCamera();
-    }
+    setState(() => _busy = false);
+    if (payload != null) await _verify(payload);
   }
 
-  Future<void> _initializeCamera() async {
-    if (_isCameraLoading) return;
-
-    setState(() {
-      _isCameraLoading = true;
-      _cameraError = false;
-    });
-
-    try {
-      await _cameraController?.dispose();
-
-      _cameras = await availableCameras();
-      if (_cameras.isEmpty) {
-        throw Exception('No camera found');
-      }
-
-      final backIndex = _cameras.indexWhere(
-            (camera) => camera.lensDirection == CameraLensDirection.back,
-      );
-
-      if (_currentCameraIndex >= _cameras.length) {
-        _currentCameraIndex = 0;
-      }
-
-      if (backIndex != -1 && _currentCameraIndex == 0) {
-        _currentCameraIndex = backIndex;
-      }
-
-      final controller = CameraController(
-        _cameras[_currentCameraIndex],
-        ResolutionPreset.high,
-        enableAudio: false,
-      );
-
-      await controller.initialize();
-
-      _minZoom = await controller.getMinZoomLevel();
-      _maxZoom = await controller.getMaxZoomLevel();
-
-      _currentZoom = math.max(1.0, _minZoom);
-      if (_currentZoom > _maxZoom) {
-        _currentZoom = _maxZoom;
-      }
-
-      await controller.setZoomLevel(_currentZoom);
-
-      if (!mounted) {
-        await controller.dispose();
-        return;
-      }
-
-      setState(() {
-        _cameraController = controller;
-        _flashOn = controller.value.flashMode == FlashMode.torch;
-        _isCameraLoading = false;
-      });
-    } catch (_) {
-      if (!mounted) return;
-      setState(() {
-        _cameraError = true;
-        _isCameraLoading = false;
-      });
-    }
+  Future<void> _history() async {
+    if (_busy) return;
+    setState(() { _busy = true; _scannerVisible = false; });
+    await Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => const HistoryPage()));
+    if (mounted) setState(() { _busy = false; _scannerVisible = true; });
   }
 
+  Future<void> _toggleTorch() async {
+    try { await _scanner.toggleTorch(); } catch (error) { _showError(error); }
+  }
   Future<void> _switchCamera() async {
-    if (_cameras.length < 2) return;
-
-    _currentCameraIndex = (_currentCameraIndex + 1) % _cameras.length;
-    await _initializeCamera();
-  }
-
-  Future<void> _toggleFlash() async {
-    final controller = _cameraController;
-    if (controller == null || !controller.value.isInitialized) return;
-
-    try {
-      if (_flashOn) {
-        await controller.setFlashMode(FlashMode.off);
-      } else {
-        await controller.setFlashMode(FlashMode.torch);
-      }
-
-      if (!mounted) return;
-      setState(() {
-        _flashOn = !_flashOn;
-      });
-    } catch (_) {}
-  }
-
-  Future<void> _setZoom(double value) async {
-    final controller = _cameraController;
-    if (controller == null || !controller.value.isInitialized) return;
-
-    setState(() {
-      _currentZoom = value;
-    });
-
-    try {
-      await controller.setZoomLevel(value);
-    } catch (_) {}
-  }
-
-  void _showFrontendOnlyMessage(String label) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text('$label UI is ready. Connect it later to your backend flow.'),
-      ),
-    );
+    try { await _scanner.switchCamera(); } catch (error) { _showError(error); }
   }
 
   @override
   Widget build(BuildContext context) {
-    final bool cameraReady =
-        _cameraPermissionStatus.isGranted &&
-            _cameraController != null &&
-            _cameraController!.value.isInitialized;
-
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: LayoutBuilder(
-        builder: (context, constraints) {
-          final frameSize = math.min(constraints.maxWidth * 0.62, 260.0);
-          final frameTop = constraints.maxHeight * 0.23;
-
-          return Stack(
-            children: [
-              Positioned.fill(
-                child: cameraReady
-                    ? CameraPreview(_cameraController!)
-                    : _buildPermissionOrLoadingBackground(),
-              ),
-
-              Positioned.fill(
-                child: Container(
-                  color: Colors.black.withOpacity(cameraReady ? 0.22 : 0.88),
-                ),
-              ),
-
-              SafeArea(
-                child: Column(
-                  children: [
-                    Padding(
-                      padding: const EdgeInsets.fromLTRB(20, 12, 20, 0),
-                      child: Row(
-                        children: [
-                          const Text(
-                            'Safe Scan QR',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontSize: 21,
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
-                          const Spacer(),
-                          _TopCircleButton(
-                            icon: _flashOn
-                                ? Icons.flash_on_rounded
-                                : Icons.flash_off_rounded,
-                            onTap: cameraReady ? _toggleFlash : null,
-                          ),
-                          const SizedBox(width: 10),
-                          _TopCircleButton(
-                            icon: Icons.cameraswitch_rounded,
-                            onTap: cameraReady ? _switchCamera : null,
-                          ),
-                        ],
-                      ),
-                    ),
-                    const Spacer(),
-                  ],
-                ),
-              ),
-
-              Positioned(
-                top: frameTop,
-                left: (constraints.maxWidth - frameSize) / 2,
-                child: SizedBox(
-                  width: frameSize,
-                  height: frameSize,
-                  child: _ScannerFrame(
-                    animation: _scanLineController,
-                    showAnimation: cameraReady,
-                  ),
-                ),
-              ),
-
-              Positioned(
-                top: frameTop + frameSize + 20,
-                left: 0,
-                right: 0,
-                child: Center(
-                  child: Text(
-                    cameraReady
-                        ? "Let's Scan A QR Code"
-                        : 'Allow camera access to start scanning',
-                    style: const TextStyle(
-                      color: Colors.white,
-                      fontSize: 16,
-                      fontWeight: FontWeight.w500,
-                    ),
-                  ),
-                ),
-              ),
-
-              if (!cameraReady)
-                Positioned(
-                  top: frameTop + frameSize + 60,
-                  left: 28,
-                  right: 28,
-                  child: Column(
-                    children: [
-                      const Text(
-                        'This page is frontend only.\nLater you can connect the scanned QR payload to your backend.',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          color: Colors.white70,
-                          fontSize: 13,
-                          height: 1.5,
-                        ),
-                      ),
-                      const SizedBox(height: 18),
-                      SizedBox(
-                        width: 190,
-                        height: 48,
-                        child: ElevatedButton(
-                          onPressed: _cameraPermissionStatus.isPermanentlyDenied
-                              ? openAppSettings
-                              : _requestCameraPermission,
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: const Color(0xFFE2B94D),
-                            foregroundColor: Colors.black,
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(14),
-                            ),
-                          ),
-                          child: Text(
-                            _cameraPermissionStatus.isPermanentlyDenied
-                                ? 'Open Settings'
-                                : 'Allow Access',
-                            style: const TextStyle(
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-
-              if (cameraReady)
-                Positioned(
-                  left: 28,
-                  right: 28,
-                  bottom: 118,
-                  child: SliderTheme(
-                    data: SliderTheme.of(context).copyWith(
-                      trackHeight: 6,
-                      thumbShape: const RoundSliderThumbShape(
-                        enabledThumbRadius: 10,
-                      ),
-                      overlayShape: const RoundSliderOverlayShape(
-                        overlayRadius: 18,
-                      ),
-                      activeTrackColor: const Color(0xFFE2B94D),
-                      inactiveTrackColor: Colors.white38,
-                      thumbColor: const Color(0xFFE2B94D),
-                      overlayColor: const Color(0x33E2B94D),
-                    ),
-                    child: Slider(
-                      min: _minZoom,
-                      max: _maxZoom,
-                      value: _currentZoom.clamp(_minZoom, _maxZoom),
-                      onChanged: _setZoom,
-                    ),
-                  ),
-                ),
-
-              Positioned(
-                left: 16,
-                right: 16,
-                bottom: 16,
-                child: _BottomActionBar(
-                  onGalleryTap: () => _showFrontendOnlyMessage('Gallery'),
-                  onHistoryTap: () => _showFrontendOnlyMessage('History'),
-                  onScanTap: () => _showFrontendOnlyMessage('Scan action'),
-                ),
-              ),
-            ],
-          );
-        },
-      ),
-    );
-  }
-
-  Widget _buildPermissionOrLoadingBackground() {
-    if (_isCameraLoading) {
-      return const Center(
-        child: CircularProgressIndicator(
-          color: Color(0xFFE2B94D),
-        ),
-      );
-    }
-
-    if (_cameraError) {
-      return const Center(
-        child: Padding(
-          padding: EdgeInsets.symmetric(horizontal: 24),
-          child: Text(
-            'Unable to load the camera preview.',
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              color: Colors.white70,
-              fontSize: 16,
-            ),
-          ),
-        ),
-      );
-    }
-
-    return Center(
-      child: Container(
-        width: 130,
-        height: 130,
-        decoration: BoxDecoration(
-          color: Colors.white.withOpacity(0.06),
-          shape: BoxShape.circle,
-          border: Border.all(
-            color: Colors.white12,
-            width: 1.2,
-          ),
-        ),
-        child: const Icon(
-          Icons.qr_code_scanner_rounded,
-          color: Colors.white70,
-          size: 54,
-        ),
-      ),
-    );
+    return Scaffold(backgroundColor: Colors.black, body: LayoutBuilder(builder: (context, constraints) {
+      final frameSize = math.min(constraints.maxWidth * 0.62, 260.0);
+      final frameTop = constraints.maxHeight * 0.23;
+      return Stack(children: [
+        if (_scannerVisible) Positioned.fill(child: MobileScanner(
+          controller: _scanner, onDetect: _onDetect,
+          errorBuilder: (context, error) => const Center(child: Padding(
+            padding: EdgeInsets.all(24), child: Text(
+              'Camera unavailable. Allow camera access in settings, or use the centre button to paste QR text.',
+              textAlign: TextAlign.center, style: TextStyle(color: Colors.white)),
+          )),
+        )),
+        Positioned.fill(child: IgnorePointer(child: Container(color: Colors.black.withOpacity(0.15)))),
+        SafeArea(child: Padding(padding: const EdgeInsets.fromLTRB(20, 12, 20, 0), child: Row(children: [
+          const Text('Safe Scan QR', style: TextStyle(color: Colors.white, fontSize: 21, fontWeight: FontWeight.w700)),
+          const Spacer(),
+          _TopCircleButton(icon: Icons.flash_on_rounded, onTap: _busy ? null : _toggleTorch),
+          const SizedBox(width: 10),
+          _TopCircleButton(icon: Icons.cameraswitch_rounded, onTap: _busy ? null : _switchCamera),
+        ]))),
+        Positioned(top: frameTop, left: (constraints.maxWidth - frameSize) / 2,
+          child: IgnorePointer(child: SizedBox(width: frameSize, height: frameSize,
+            child: _ScannerFrame(animation: _scanLineController, showAnimation: !_busy)))),
+        Positioned(top: frameTop + frameSize + 20, left: 20, right: 20,
+          child: Text(_busy ? 'Verifying…' : 'Point at a QR code, or tap the centre button to paste text',
+            textAlign: TextAlign.center, style: const TextStyle(color: Colors.white, fontSize: 16))),
+        Positioned(left: 28, right: 28, bottom: 126, child: Slider(
+          value: _zoom, activeColor: const Color(0xFFE2B94D), onChanged: _busy ? null : (value) async {
+            setState(() => _zoom = value);
+            try { await _scanner.setZoomScale(value); } catch (error) { _showError(error); }
+          })),
+        Positioned(left: 16, right: 16, bottom: 16, child: _BottomActionBar(
+          onGalleryTap: _gallery, onHistoryTap: _history, onScanTap: _manualEntry)),
+        if (_busy) const Positioned.fill(child: AbsorbPointer(child: ColoredBox(
+          color: Color(0x55000000), child: Center(child: CircularProgressIndicator(color: Color(0xFFE2B94D)))))),
+      ]);
+    }));
   }
 }
-
 class _TopCircleButton extends StatelessWidget {
   final IconData icon;
   final VoidCallback? onTap;
